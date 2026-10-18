@@ -1,8 +1,3 @@
---[[
-    Midnight UI Library (Full Unabridged Framework)
-    Извлечено из HeadShot / Midnight. Полный набор компонентов интерфейса.
-]]
-
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
@@ -60,7 +55,6 @@ local Theme = {
 	AccentBlue = Color3.fromRGB(245, 247, 252),
 	AccentWhite = Color3.fromRGB(245, 247, 252),
 	AccentDark = Color3.fromRGB(12, 14, 20),
-	AccentGlow = Color3.fromRGB(215, 222, 235),
 	AccentRed = Color3.fromRGB(245, 56, 75),
 	TextPrimary = Color3.fromRGB(240, 243, 250),
 	TextSecondary = Color3.fromRGB(105, 115, 134),
@@ -84,6 +78,10 @@ local MidnightUI = {
 	ResponsiveScale = 1,
 	MenuRestPosition = UDim2.new(0.5, 0, 0.5, 0),
 	MobileLogoMode = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled,
+	MascotAnimationId = 0,
+	HudAnimationSerial = 0,
+	CurrentLanguage = "en",
+	ConfigFolder = "midnight_configs",
 	Theme = Theme,
 	Layout = {
 		WindowWidth = 680,
@@ -110,8 +108,28 @@ local MidnightUI = {
 	DragState = {},
 	ResizeState = nil,
 	ActiveCloseDropdown = nil,
-	ConfigFolder = "midnight_configs",
+	I18n = {
+		Dict = {
+			["GENERAL"] = "ОБЩИЕ",
+			["SETTINGS"] = "НАСТРОЙКИ",
+			["MISC"] = "РАЗНОЕ",
+			["Interface"] = "Интерфейс",
+			["Configs"] = "Конфиги",
+			["HUD Widget"] = "Виджет HUD",
+			["Show Mascot"] = "Показывать маскота",
+			["Browse Configs"] = "Обзор конфигов",
+			["Save Config"] = "Сохранить конфиг",
+			["Load Typed"] = "Загрузить имя",
+			["Search..."] = "Поиск...",
+			["Language"] = "Язык",
+		},
+		Reverse = {}
+	}
 }
+
+for en, ru in pairs(MidnightUI.I18n.Dict) do
+	MidnightUI.I18n.Reverse[ru] = en
+end
 
 function MidnightUI:Connect(signal, callback, once)
 	if not self.Alive then return nil end
@@ -196,13 +214,109 @@ function MidnightUI:ClampGuiPosition(gui, position, size)
 end
 
 -- ==========================================================
--- ИНИЦИАЛИЗАЦИЯ ГЛАВНОГО ОКНА
+-- СИСТЕМА КОНФИГУРАЦИЙ (FILE API + JSON)
 -- ==========================================================
+local function sanitizeConfigName(name)
+	local clean = tostring(name or "default"):gsub("%.json$", ""):gsub("[^%w_%-%s]", ""):gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", "_")
+	return clean == "" and "default" or clean:sub(1, 48)
+end
 
+function MidnightUI:EnsureConfigFolder()
+	if not fileApi.makefolder then return false end
+	if fileApi.isfolder then
+		local ok, exists = pcall(fileApi.isfolder, self.ConfigFolder)
+		if ok and exists then return true end
+	end
+	return pcall(fileApi.makefolder, self.ConfigFolder)
+end
+
+local function encodeConfig(value)
+	if typeof(value) == "Color3" then
+		return { __type = "Color3", r = math.round(value.R * 255), g = math.round(value.G * 255), b = math.round(value.B * 255) }
+	elseif type(value) == "table" then
+		local t = {}
+		for k, v in pairs(value) do t[k] = encodeConfig(v) end
+		return t
+	end
+	return value
+end
+
+local function decodeConfig(value)
+	if type(value) ~= "table" then return value end
+	if value.__type == "Color3" then
+		return Color3.fromRGB(math.clamp(tonumber(value.r) or 255, 0, 255), math.clamp(tonumber(value.g) or 255, 0, 255), math.clamp(tonumber(value.b) or 255, 0, 255))
+	end
+	local t = {}
+	for k, v in pairs(value) do t[k] = decodeConfig(v) end
+	return t
+end
+
+function MidnightUI:SaveConfig(name, settingsTable)
+	if not fileApi.writefile or not self:EnsureConfigFolder() then return false, "File API Unavailable" end
+	local clean = sanitizeConfigName(name)
+	local path = self.ConfigFolder .. "/" .. clean .. ".json"
+	local ok, err = pcall(function()
+		local payload = { Version = 1, SavedAt = os.time(), Data = encodeConfig(settingsTable or {}) }
+		fileApi.writefile(path, HttpService:JSONEncode(payload))
+	end)
+	if self.RefreshConfigPicker then self.RefreshConfigPicker() end
+	return ok, ok and clean or err
+end
+
+function MidnightUI:LoadConfig(name)
+	if not fileApi.readfile or not fileApi.isfile then return nil, "File API Unavailable" end
+	local clean = sanitizeConfigName(name)
+	local path = self.ConfigFolder .. "/" .. clean .. ".json"
+	local existsOk, exists = pcall(fileApi.isfile, path)
+	if not existsOk or not exists then return nil, "File not found" end
+	local ok, text = pcall(fileApi.readfile, path)
+	if not ok then return nil, "Read error" end
+	local dok, decoded = pcall(function() return HttpService:JSONDecode(text) end)
+	if not dok or type(decoded) ~= "table" then return nil, "Decode error" end
+	return decodeConfig(decoded.Data or decoded), clean
+end
+
+function MidnightUI:DeleteConfig(name)
+	if not fileApi.delfile or not fileApi.isfile then return false end
+	local clean = sanitizeConfigName(name)
+	local path = self.ConfigFolder .. "/" .. clean .. ".json"
+	local ok = pcall(fileApi.delfile, path)
+	if self.RefreshConfigPicker then self.RefreshConfigPicker() end
+	return ok
+end
+
+-- ==========================================================
+-- ЛОКАЛИЗАЦИЯ (I18N)
+-- ==========================================================
+function MidnightUI:SetLanguage(lang)
+	self.CurrentLanguage = (lang == "ru" or lang == 2) and "ru" or "en"
+	local isRu = (self.CurrentLanguage == "ru")
+	if not self.MainFrame then return end
+	for _, inst in ipairs(self.MainFrame:GetDescendants()) do
+		if inst:IsA("TextLabel") or inst:IsA("TextButton") then
+			local cur = inst.Text
+			if cur and cur ~= "" and inst.Name ~= "EN" and inst.Name ~= "RU" and inst.Name ~= "UserAvatar" then
+				if isRu then
+					local ru = self.I18n.Dict[cur] or self.I18n.Dict[self.I18n.Reverse[cur]]
+					if ru then inst.Text = ru end
+				else
+					local en = self.I18n.Reverse[cur]
+					if en then inst.Text = en end
+				end
+			end
+		elseif inst:IsA("TextBox") and inst.Name == "SearchInput" then
+			inst.PlaceholderText = isRu and "Поиск..." or "Search..."
+		end
+	end
+end
+
+-- ==========================================================
+-- СОЗДАНИЕ ГЛАВНОГО ОКНА
+-- ==========================================================
 function MidnightUI:CreateWindow(windowConfig)
 	windowConfig = windowConfig or {}
 	local Title = windowConfig.Title or "Midnight"
-	local Subtitle = windowConfig.Subtitle or "user interface framework"
+	local Subtitle = windowConfig.Subtitle or "interface framework"
 	self.ConfigFolder = windowConfig.ConfigFolder or "midnight_configs"
 
 	if windowConfig.ToggleKey then self.ToggleKey = windowConfig.ToggleKey end
@@ -261,29 +375,23 @@ function MidnightUI:CreateWindow(windowConfig)
 			self.MenuRestPosition = MainFrame.Position
 			self.DragState.TargetPosition = MainFrame.Position
 		end
+		if self.HudWidget then
+			self.HudWidget.Position = self:ClampGuiPosition(self.HudWidget, self.HudWidget.Position)
+		end
 		if self.FloatingLogo then
 			self.FloatingLogo.Position = self:ClampGuiPosition(self.FloatingLogo, self.FloatingLogo.Position)
 		end
 	end
 
-	local cameraConnection
-	local function bindCamera()
-		if cameraConnection then cameraConnection:Disconnect() end
-		if Workspace.CurrentCamera then
-			cameraConnection = self:Connect(Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"), updateMainScale)
-		end
-		updateMainScale()
-	end
-	self:Connect(Workspace:GetPropertyChangedSignal("CurrentCamera"), bindCamera)
+	self:Connect(Workspace:GetPropertyChangedSignal("CurrentCamera"), updateMainScale)
 	self:Connect(ScreenGui:GetPropertyChangedSignal("AbsoluteSize"), function()
 		self:CancelPointerDrags()
 		updateMainScale()
 	end)
 	self:Connect(MainFrame:GetPropertyChangedSignal("Size"), updateMainScale)
 	self.RefreshGuiLayout = updateMainScale
-	bindCamera()
 
-	-- Resize Handle
+	-- Ресайз за нижний правый угол
 	local ResizeHandle = Instance.new("TextButton")
 	ResizeHandle.Name = "ResizeHandle"
 	ResizeHandle.Size = UDim2.new(0, 24, 0, 24)
@@ -305,7 +413,6 @@ function MidnightUI:CreateWindow(windowConfig)
 	self:Connect(ResizeHandle.InputBegan, function(input)
 		if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
 		if not self.IsOpen then return end
-		if isPointerActive(self.ResizeState.Input, self.ResizeState.Serial) then return end
 		self:CancelPointerDrags()
 		self.ResizeState.Active = true
 		self.ResizeState.Input = input
@@ -529,6 +636,7 @@ function MidnightUI:CreateWindow(windowConfig)
 	Breadcrumb.ZIndex = 3
 	Breadcrumb.Parent = Header
 
+	-- Search Input
 	local SearchContainer = Instance.new("Frame")
 	SearchContainer.Name = "SearchContainer"
 	SearchContainer.Size = UDim2.new(0, 160, 0, 28)
@@ -592,6 +700,7 @@ function MidnightUI:CreateWindow(windowConfig)
 	AvatarStroke.Thickness = 1
 	AvatarStroke.Parent = UserAvatar
 
+	-- Nav Container
 	local NavContainer = Instance.new("ScrollingFrame")
 	NavContainer.Name = "NavContainer"
 	NavContainer.Size = UDim2.new(1, -16, 1, -84)
@@ -612,6 +721,34 @@ function MidnightUI:CreateWindow(windowConfig)
 	NavLayout.SortOrder = Enum.SortOrder.LayoutOrder
 	NavLayout.Parent = NavContainer
 
+	-- Фоновая сетка
+	local ContentBg = Instance.new("Frame")
+	ContentBg.Size = UDim2.new(1, -self.Layout.SidebarWidth, 1, -48)
+	ContentBg.Position = UDim2.new(0, self.Layout.SidebarWidth, 0, 48)
+	ContentBg.BackgroundTransparency = 1
+	ContentBg.ClipsDescendants = true
+	ContentBg.ZIndex = 1
+	ContentBg.Parent = MainFrame
+
+	for i = 0, 16 do
+		local vLine = Instance.new("Frame")
+		vLine.Size = UDim2.new(0, 1, 1, 0)
+		vLine.Position = UDim2.new(0, i * 32, 0, 0)
+		vLine.BackgroundColor3 = Color3.fromRGB(180, 195, 220)
+		vLine.BackgroundTransparency = 0.97
+		vLine.BorderSizePixel = 0
+		vLine.Parent = ContentBg
+	end
+	for j = 0, 18 do
+		local hLine = Instance.new("Frame")
+		hLine.Size = UDim2.new(1, 0, 0, 1)
+		hLine.Position = UDim2.new(0, 0, 0, j * 32)
+		hLine.BackgroundColor3 = Color3.fromRGB(180, 195, 220)
+		hLine.BackgroundTransparency = 0.97
+		hLine.BorderSizePixel = 0
+		hLine.Parent = ContentBg
+	end
+
 	local PagesContainer = Instance.new("Frame")
 	PagesContainer.Name = "PagesContainer"
 	PagesContainer.Size = UDim2.new(1, -self.Layout.SidebarWidth, 1, -48)
@@ -621,7 +758,7 @@ function MidnightUI:CreateWindow(windowConfig)
 	PagesContainer.ZIndex = 2
 	PagesContainer.Parent = MainFrame
 
-	-- Smooth Dragging
+	-- Инерционный драг
 	self.DragState = {
 		Active = false,
 		Smooth = false,
@@ -705,8 +842,185 @@ function MidnightUI:CreateWindow(windowConfig)
 		TabOrder = 0,
 	}
 
-	self:_InitPopups(MainFrame)
+	-- 1. Ватермарка (HUD Widget)
+	function Window:CreateWatermark(wCfg)
+		wCfg = wCfg or {}
+		local textPrefix = wCfg.Title or Title
+		local textAccent = wCfg.Accented or "UI"
 
+		local HudWidget = Instance.new("Frame")
+		HudWidget.Name = "MidnightWatermark"
+		HudWidget.Size = UDim2.new(0, 310, 0, 36)
+		HudWidget.Position = wCfg.Position or UDim2.new(0.5, 0, 0.82, 0)
+		HudWidget.AnchorPoint = Vector2.new(0.5, 0.5)
+		HudWidget.BackgroundColor3 = Color3.fromRGB(14, 16, 22)
+		HudWidget.BorderSizePixel = 0
+		HudWidget.Visible = true
+		HudWidget.Active = true
+		HudWidget.ZIndex = 50
+		HudWidget.Parent = ScreenGui
+		MidnightUI.HudWidget = HudWidget
+
+		local hudCorner = Instance.new("UICorner")
+		hudCorner.CornerRadius = UDim.new(0, 18)
+		hudCorner.Parent = HudWidget
+
+		local hudStroke = Instance.new("UIStroke")
+		hudStroke.Color = Color3.fromRGB(40, 43, 50)
+		hudStroke.Thickness = 1.2
+		hudStroke.Parent = HudWidget
+
+		local hudLabel = Instance.new("TextLabel")
+		hudLabel.Size = UDim2.new(1, -48, 1, 0)
+		hudLabel.Position = UDim2.new(0, 16, 0, 0)
+		hudLabel.BackgroundTransparency = 1
+		hudLabel.Font = Theme.FontMedium
+		hudLabel.TextSize = 13
+		hudLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+		hudLabel.TextXAlignment = Enum.TextXAlignment.Left
+		hudLabel.RichText = true
+		hudLabel.Text = string.format('%s<font color="rgb(107,181,235)">%s</font>   0 ms   60 fps   --:--', textPrefix, textAccent)
+		hudLabel.ZIndex = 51
+		hudLabel.Parent = HudWidget
+
+		local hudAvatar = Instance.new("ImageLabel")
+		hudAvatar.Size = UDim2.new(0, 24, 0, 24)
+		hudAvatar.Position = UDim2.new(1, -30, 0.5, -12)
+		hudAvatar.BackgroundTransparency = 1
+		hudAvatar.Image = "rbxthumb://type=AvatarHeadShot&id=" .. tostring(LocalPlayer.UserId) .. "&w=100&h=100"
+		hudAvatar.ZIndex = 52
+		hudAvatar.Parent = HudWidget
+
+		local hudAvatarCorner = Instance.new("UICorner")
+		hudAvatarCorner.CornerRadius = UDim.new(1, 0)
+		hudAvatarCorner.Parent = hudAvatar
+
+		local hDrag, hStart, hPos
+		MidnightUI:Connect(HudWidget.InputBegan, function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				hDrag = true
+				hStart = input.Position
+				hPos = HudWidget.Position
+			end
+		end)
+		MidnightUI:Connect(UserInputService.InputChanged, function(input)
+			if hDrag and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+				local d = input.Position - hStart
+				HudWidget.Position = MidnightUI:ClampGuiPosition(HudWidget, UDim2.new(hPos.X.Scale, hPos.X.Offset + d.X, hPos.Y.Scale, hPos.Y.Offset + d.Y))
+			end
+		end)
+		MidnightUI:Connect(UserInputService.InputEnded, function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				hDrag = false
+			end
+		end)
+
+		local fpsCount = 0
+		local fpsTimer = os.clock()
+		local liveFps = 60
+		local lastUpdate = 0
+
+		MidnightUI:Connect(RunService.RenderStepped, function()
+			fpsCount = fpsCount + 1
+			local now = os.clock()
+			if now - fpsTimer >= 0.5 then
+				liveFps = math.clamp(math.round(fpsCount / math.max(0.001, now - fpsTimer)), 1, 999)
+				fpsCount = 0
+				fpsTimer = now
+			end
+
+			if HudWidget.Visible and now - lastUpdate >= 0.25 then
+				lastUpdate = now
+				local ping = 0
+				pcall(function() ping = math.round(LocalPlayer:GetNetworkPing() * 1000) end)
+				local lt = DateTime.now():ToLocalTime()
+				local clock = string.format("%02d:%02d", lt.Hour, lt.Minute)
+				hudLabel.Text = string.format('%s<font color="rgb(107,181,235)">%s</font>   %d ms   %d fps   %s', textPrefix, textAccent, ping, liveFps, clock)
+			end
+		end)
+
+		return {
+			SetVisible = function(v) HudWidget.Visible = v end,
+			Widget = HudWidget,
+		}
+	end
+
+	-- 2. Маскот (Mascot)
+	function Window:CreateMascot(mCfg)
+		mCfg = mCfg or {}
+		local assetId = mCfg.AssetId or "rbxthumb://type=Asset&id=74604987948058&w=420&h=420"
+
+		local MascotImage = Instance.new("ImageLabel")
+		MascotImage.Name = "Mascot"
+		MascotImage.Size = UDim2.new(0, 129, 0, 215)
+		MascotImage.AnchorPoint = Vector2.new(0.5, 1)
+		MascotImage.BackgroundTransparency = 1
+		MascotImage.Image = assetId
+		MascotImage.ScaleType = Enum.ScaleType.Fit
+		MascotImage.ZIndex = 1
+		MascotImage.Parent = ScreenGui
+		MidnightUI.MascotImage = MascotImage
+
+		local MascotClick = Instance.new("TextButton")
+		MascotClick.Name = "MascotClick"
+		MascotClick.Text = ""
+		MascotClick.BackgroundTransparency = 1
+		MascotClick.AnchorPoint = Vector2.new(0.5, 1)
+		MascotClick.ZIndex = 3
+		MascotClick.Parent = ScreenGui
+
+		local HeightScale = Instance.new("NumberValue")
+		HeightScale.Value = 1
+		HeightScale.Parent = MascotImage
+
+		local animSerial = 0
+		local function playAnimation()
+			animSerial = animSerial + 1
+			local cur = animSerial
+			HeightScale.Value = 1
+			local squeeze = TweenService:Create(HeightScale, TweenInfo.new(0.09, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Value = 0.58 })
+			squeeze:Play()
+			task.delay(0.09, function()
+				if cur ~= animSerial then return end
+				TweenService:Create(HeightScale, TweenInfo.new(0.24, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Value = 1 }):Play()
+			end)
+		end
+		MascotClick.Activated:Connect(playAnimation)
+
+		local function updateMascot()
+			if not MidnightUI.Alive or not MainFrame then return end
+			local scale = (MidnightUI.MainScale and MidnightUI.MainScale.Scale) or 1
+			local fPos = MainFrame.AbsolutePosition
+			local fSize = MainFrame.AbsoluteSize
+			local mH = math.max(80, math.floor(215 * scale))
+			local mW = math.floor(mH * 0.6)
+			local curH = mH * HeightScale.Value
+			local hiddenOffset = math.floor(45 * scale)
+
+			MascotImage.Size = UDim2.fromOffset(mW, curH)
+			MascotImage.Position = UDim2.fromOffset(fPos.X + fSize.X - 134 * scale, fPos.Y + hiddenOffset)
+			MascotImage.Visible = MainFrame.Visible
+
+			MascotClick.Size = UDim2.fromOffset(mW + 48 * scale, math.max(1, curH - hiddenOffset))
+			MascotClick.Position = UDim2.fromOffset(fPos.X + fSize.X - 134 * scale, fPos.Y)
+			MascotClick.Visible = MainFrame.Visible
+		end
+
+		MidnightUI:Connect(MainFrame:GetPropertyChangedSignal("AbsolutePosition"), updateMascot)
+		MidnightUI:Connect(MainFrame:GetPropertyChangedSignal("AbsoluteSize"), updateMascot)
+		MidnightUI:Connect(HeightScale.Changed, updateMascot)
+		updateMascot()
+
+		return {
+			SetVisible = function(v)
+				MascotImage.Visible = v
+				MascotClick.Visible = v
+			end,
+			PlayAnimation = playAnimation
+		}
+	end
+
+	-- Переключение вкладок
 	local tabTransitionSerial = 0
 	function Window:SwitchTab(tabName)
 		local targetTab = self.Tabs[tabName]
@@ -780,10 +1094,9 @@ function MidnightUI:CreateWindow(windowConfig)
 	function Window:AddNavSection(title)
 		self.TabOrder = self.TabOrder + 1
 		local secLabel = Instance.new("TextLabel")
-		secLabel.Name = title .. "Section"
 		secLabel.Size = UDim2.new(1, -8, 0, self.TabOrder == 1 and 18 or 26)
 		secLabel.BackgroundTransparency = 1
-		secLabel.Text = title
+		secLabel.Text = string.upper(title)
 		secLabel.Font = Theme.FontBold
 		secLabel.TextSize = 10
 		secLabel.TextColor3 = Color3.fromRGB(80, 90, 110)
@@ -813,7 +1126,6 @@ function MidnightUI:CreateWindow(windowConfig)
 		btnCorner.Parent = btn
 
 		local indicator = Instance.new("Frame")
-		indicator.Name = "Indicator"
 		indicator.Size = UDim2.new(0, 3, 0, 0)
 		indicator.Position = UDim2.new(0, 0, 0.5, 0)
 		indicator.BackgroundColor3 = Theme.AccentBlue
@@ -825,7 +1137,6 @@ function MidnightUI:CreateWindow(windowConfig)
 		indCorner.Parent = indicator
 
 		local iconLabel = Instance.new("ImageLabel")
-		iconLabel.Name = "Icon"
 		iconLabel.Size = UDim2.new(0, 17, 0, 17)
 		iconLabel.Position = UDim2.new(0, 13, 0.5, -8)
 		iconLabel.BackgroundTransparency = 1
@@ -834,7 +1145,6 @@ function MidnightUI:CreateWindow(windowConfig)
 		iconLabel.Parent = btn
 
 		local textLabel = Instance.new("TextLabel")
-		textLabel.Name = "Label"
 		textLabel.Size = UDim2.new(1, -44, 1, 0)
 		textLabel.Position = UDim2.new(0, 40, 0, 0)
 		textLabel.BackgroundTransparency = 1
@@ -846,7 +1156,6 @@ function MidnightUI:CreateWindow(windowConfig)
 		textLabel.Parent = btn
 
 		local page = Instance.new("CanvasGroup")
-		page.Name = name .. "Page"
 		page.Size = UDim2.new(1, 0, 1, 0)
 		page.Position = UDim2.new(0, 0, 0, 0)
 		page.BackgroundTransparency = 1
@@ -896,7 +1205,7 @@ function MidnightUI:CreateWindow(windowConfig)
 		return Tab
 	end
 
-	self.Window = Window
+	self:_InitPopups(MainFrame)
 	updateMainScale()
 	return Window
 end
@@ -904,7 +1213,6 @@ end
 -- ==========================================================
 -- МЕНЮ И МОБИЛЬНЫЙ ТОГГЛ
 -- ==========================================================
-
 function MidnightUI:ToggleMenu()
 	if not self.Alive or not self.MainFrame then return end
 	self.IsOpen = not self.IsOpen
@@ -997,7 +1305,6 @@ end
 -- ==========================================================
 -- КАРТОЧКИ И ЭЛЕМЕНТЫ УПРАВЛЕНИЯ
 -- ==========================================================
-
 function MidnightUI:CreateCard(parent, title, size, position)
 	local card = Instance.new("Frame")
 	card.Name = title:gsub("%s+", "") .. "Card"
@@ -1103,7 +1410,6 @@ function MidnightUI:CreateCardSection(parent, title, posY, onToggle)
 	label.Parent = sectionFrame
 
 	local line = Instance.new("Frame")
-	line.Name = "Line"
 	line.Size = UDim2.new(1, -28, 0, 1)
 	line.Position = UDim2.new(0, 0, 1, -1)
 	line.BackgroundColor3 = Theme.CardStroke
@@ -1111,7 +1417,6 @@ function MidnightUI:CreateCardSection(parent, title, posY, onToggle)
 	line.Parent = sectionFrame
 
 	local arrowBtn = Instance.new("TextButton")
-	arrowBtn.Name = "ArrowBtn"
 	arrowBtn.Size = UDim2.new(0, 20, 0, 20)
 	arrowBtn.Position = UDim2.new(1, -20, 0.5, -10)
 	arrowBtn.BackgroundColor3 = Color3.fromRGB(18, 22, 30)
@@ -1124,23 +1429,15 @@ function MidnightUI:CreateCardSection(parent, title, posY, onToggle)
 	btnCorner.CornerRadius = UDim.new(0, 4)
 	btnCorner.Parent = arrowBtn
 
-	local btnStroke = Instance.new("UIStroke")
-	btnStroke.Color = Theme.CardStroke
-	btnStroke.Thickness = 1
-	btnStroke.Parent = arrowBtn
-
 	local arrowIcon = Instance.new("ImageLabel")
-	arrowIcon.Name = "ArrowIcon"
 	arrowIcon.Size = UDim2.new(0, 12, 0, 12)
 	arrowIcon.Position = UDim2.new(0.5, -6, 0.5, -6)
 	arrowIcon.BackgroundTransparency = 1
 	arrowIcon.Image = self.Icons.Arrow
 	arrowIcon.ImageColor3 = Color3.fromRGB(150, 160, 180)
-	arrowIcon.Rotation = 0
 	arrowIcon.Parent = arrowBtn
 
 	local container = Instance.new("Frame")
-	container.Name = title:gsub("%s+", "") .. "Container"
 	container.Size = UDim2.new(1, 0, 0, 0)
 	container.Position = UDim2.new(0, 0, 0, posY + 26)
 	container.BackgroundTransparency = 1
@@ -1182,7 +1479,6 @@ end
 
 function MidnightUI:CreateButton(parent, text, posY, callback)
 	local btn = Instance.new("TextButton")
-	btn.Name = text:gsub("%s+", "") .. "Btn"
 	btn.Size = UDim2.new(1, -20, 0, 28)
 	btn.Position = UDim2.new(0, 10, 0, posY)
 	btn.BackgroundColor3 = Color3.fromRGB(20, 24, 32)
@@ -1229,14 +1525,12 @@ end
 
 function MidnightUI:CreateToggle(parent, labelText, posY, defaultVal, callback)
 	local row = Instance.new("Frame")
-	row.Name = labelText:gsub("%s+", "") .. "Row"
 	row.Size = UDim2.new(1, -20, 0, 24)
 	row.Position = UDim2.new(0, 10, 0, posY)
 	row.BackgroundTransparency = 1
 	row.Parent = parent
 
 	local label = Instance.new("TextLabel")
-	label.Name = "Label"
 	label.Size = UDim2.new(1, -44, 1, 0)
 	label.BackgroundTransparency = 1
 	label.Text = labelText
@@ -1247,7 +1541,6 @@ function MidnightUI:CreateToggle(parent, labelText, posY, defaultVal, callback)
 	label.Parent = row
 
 	local toggleBtn = Instance.new("TextButton")
-	toggleBtn.Name = "Toggle"
 	toggleBtn.Size = UDim2.new(0, 36, 0, 18)
 	toggleBtn.Position = UDim2.new(1, -36, 0.5, -9)
 	toggleBtn.BackgroundColor3 = defaultVal and Theme.AccentBlue or Theme.ToggleOff
@@ -1266,7 +1559,6 @@ function MidnightUI:CreateToggle(parent, labelText, posY, defaultVal, callback)
 	toggleStroke.Parent = toggleBtn
 
 	local knob = Instance.new("Frame")
-	knob.Name = "Knob"
 	knob.Size = UDim2.new(0, 12, 0, 12)
 	knob.Position = defaultVal and UDim2.new(1, -15, 0.5, -6) or UDim2.new(0, 3, 0.5, -6)
 	knob.BackgroundColor3 = defaultVal and Theme.AccentDark or Theme.ToggleKnob
@@ -1278,7 +1570,6 @@ function MidnightUI:CreateToggle(parent, labelText, posY, defaultVal, callback)
 	knobCorner.Parent = knob
 
 	local isToggled = defaultVal == true
-
 	local function renderToggle(animated)
 		local targetBg = isToggled and Theme.AccentBlue or Theme.ToggleOff
 		local targetKnob = isToggled and Theme.AccentDark or Theme.ToggleKnob
@@ -1299,9 +1590,7 @@ function MidnightUI:CreateToggle(parent, labelText, posY, defaultVal, callback)
 	setValue.Event:Connect(function(value, invokeCallback)
 		isToggled = value == true
 		renderToggle(invokeCallback == true)
-		if invokeCallback and callback then
-			callback(isToggled)
-		end
+		if invokeCallback and callback then callback(isToggled) end
 	end)
 
 	toggleBtn.MouseButton1Click:Connect(function()
@@ -1320,7 +1609,6 @@ function MidnightUI:CreateToggleWithKeybind(parent, labelText, posY, defaultVal,
 
 	local currentKey = tostring(defaultKey or "C")
 	local bindButton = Instance.new("TextButton")
-	bindButton.Name = "Keybind"
 	bindButton.Size = UDim2.new(0, 22, 0, 22)
 	bindButton.Position = UDim2.new(1, -64, 0.5, -11)
 	bindButton.BackgroundTransparency = 1
@@ -1329,7 +1617,6 @@ function MidnightUI:CreateToggleWithKeybind(parent, labelText, posY, defaultVal,
 	bindButton.Parent = row
 
 	local keyboardIcon = Instance.new("ImageLabel")
-	keyboardIcon.Name = "KeyboardIcon"
 	keyboardIcon.Size = UDim2.new(0, 17, 0, 17)
 	keyboardIcon.Position = UDim2.new(0.5, -8, 0.5, -8)
 	keyboardIcon.BackgroundTransparency = 1
@@ -1367,14 +1654,12 @@ end
 
 function MidnightUI:CreateToggleWithColor(parent, labelText, posY, defaultVal, defaultColor, onToggleCallback, onColorCallback)
 	local row = Instance.new("Frame")
-	row.Name = labelText:gsub("%s+", "") .. "Row"
 	row.Size = UDim2.new(1, -20, 0, 24)
 	row.Position = UDim2.new(0, 10, 0, posY)
 	row.BackgroundTransparency = 1
 	row.Parent = parent
 
 	local label = Instance.new("TextLabel")
-	label.Name = "Label"
 	label.Size = UDim2.new(1, -66, 1, 0)
 	label.BackgroundTransparency = 1
 	label.Text = labelText
@@ -1385,7 +1670,6 @@ function MidnightUI:CreateToggleWithColor(parent, labelText, posY, defaultVal, d
 	label.Parent = row
 
 	local colorBox = Instance.new("TextButton")
-	colorBox.Name = "ColorBox"
 	colorBox.Size = UDim2.new(0, 18, 0, 18)
 	colorBox.Position = UDim2.new(1, -60, 0.5, -9)
 	colorBox.BackgroundColor3 = defaultColor or Color3.fromRGB(255, 55, 55)
@@ -1398,13 +1682,7 @@ function MidnightUI:CreateToggleWithColor(parent, labelText, posY, defaultVal, d
 	colorCorner.CornerRadius = UDim.new(0, 4)
 	colorCorner.Parent = colorBox
 
-	local colorStroke = Instance.new("UIStroke")
-	colorStroke.Color = Theme.CardStroke
-	colorStroke.Thickness = 1
-	colorStroke.Parent = colorBox
-
 	local toggleBtn = Instance.new("TextButton")
-	toggleBtn.Name = "Toggle"
 	toggleBtn.Size = UDim2.new(0, 36, 0, 18)
 	toggleBtn.Position = UDim2.new(1, -36, 0.5, -9)
 	toggleBtn.BackgroundColor3 = defaultVal and Theme.AccentBlue or Theme.ToggleOff
@@ -1418,7 +1696,6 @@ function MidnightUI:CreateToggleWithColor(parent, labelText, posY, defaultVal, d
 	toggleCorner.Parent = toggleBtn
 
 	local knob = Instance.new("Frame")
-	knob.Name = "Knob"
 	knob.Size = UDim2.new(0, 12, 0, 12)
 	knob.Position = defaultVal and UDim2.new(1, -15, 0.5, -6) or UDim2.new(0, 3, 0.5, -6)
 	knob.BackgroundColor3 = Theme.ToggleKnob
@@ -1474,14 +1751,12 @@ function MidnightUI:CreateSlider(parent, labelText, posY, minVal, maxVal, defaul
 	step = step or 1
 	unit = unit or ""
 	local row = Instance.new("Frame")
-	row.Name = labelText:gsub("%s+", "") .. "Row"
 	row.Size = UDim2.new(1, -20, 0, 24)
 	row.Position = UDim2.new(0, 10, 0, posY)
 	row.BackgroundTransparency = 1
 	row.Parent = parent
 
 	local label = Instance.new("TextLabel")
-	label.Name = "Label"
 	label.Size = UDim2.new(1, -30, 1, 0)
 	label.BackgroundTransparency = 1
 	label.Text = labelText
@@ -1489,32 +1764,23 @@ function MidnightUI:CreateSlider(parent, labelText, posY, minVal, maxVal, defaul
 	label.TextSize = 13
 	label.TextColor3 = Theme.TextPrimary
 	label.TextXAlignment = Enum.TextXAlignment.Left
-	label.TextTruncate = Enum.TextTruncate.AtEnd
 	label.Parent = row
 
 	local currentVal = defaultVal
 
 	local sliderBtn = Instance.new("TextButton")
-	sliderBtn.Name = "SlidersBtn"
 	sliderBtn.Size = UDim2.new(0, 20, 0, 20)
 	sliderBtn.Position = UDim2.new(1, -22, 0.5, -10)
 	sliderBtn.BackgroundColor3 = Color3.fromRGB(22, 26, 36)
 	sliderBtn.BorderSizePixel = 0
 	sliderBtn.Text = ""
-	sliderBtn.AutoButtonColor = false
 	sliderBtn.Parent = row
 
 	local btnCorner = Instance.new("UICorner")
 	btnCorner.CornerRadius = UDim.new(0, 4)
 	btnCorner.Parent = sliderBtn
 
-	local btnStroke = Instance.new("UIStroke")
-	btnStroke.Color = Theme.CardStroke
-	btnStroke.Thickness = 1
-	btnStroke.Parent = sliderBtn
-
 	local btnIcon = Instance.new("ImageLabel")
-	btnIcon.Name = "Icon"
 	btnIcon.Size = UDim2.new(0, 12, 0, 12)
 	btnIcon.Position = UDim2.new(0.5, -6, 0.5, -6)
 	btnIcon.BackgroundTransparency = 1
@@ -1542,11 +1808,6 @@ function MidnightUI:CreateSlider(parent, labelText, posY, minVal, maxVal, defaul
 	setValue.Parent = row
 	setValue.Event:Connect(applyVal)
 
-	local setSliderValue = Instance.new("BindableEvent")
-	setSliderValue.Name = "SetSliderValue"
-	setSliderValue.Parent = row
-	setSliderValue.Event:Connect(applyVal)
-
 	return row
 end
 
@@ -1554,14 +1815,12 @@ function MidnightUI:CreateToggleWithSlider(parent, labelText, posY, defaultToggl
 	step = step or 1
 	unit = unit or ""
 	local row = Instance.new("Frame")
-	row.Name = labelText:gsub("%s+", "") .. "Row"
 	row.Size = UDim2.new(1, -20, 0, 24)
 	row.Position = UDim2.new(0, 10, 0, posY)
 	row.BackgroundTransparency = 1
 	row.Parent = parent
 
 	local label = Instance.new("TextLabel")
-	label.Name = "Label"
 	label.Size = UDim2.new(1, -68, 1, 0)
 	label.Position = UDim2.new(0, 0, 0, 0)
 	label.BackgroundTransparency = 1
@@ -1570,33 +1829,24 @@ function MidnightUI:CreateToggleWithSlider(parent, labelText, posY, defaultToggl
 	label.TextSize = 13
 	label.TextColor3 = Theme.TextPrimary
 	label.TextXAlignment = Enum.TextXAlignment.Left
-	label.TextTruncate = Enum.TextTruncate.AtEnd
 	label.Parent = row
 
 	local currentSliderVal = defaultSlider
 	local isToggled = defaultToggle == true
 
 	local sliderBtn = Instance.new("TextButton")
-	sliderBtn.Name = "SlidersBtn"
 	sliderBtn.Size = UDim2.new(0, 20, 0, 20)
 	sliderBtn.Position = UDim2.new(1, -62, 0.5, -10)
 	sliderBtn.BackgroundColor3 = Color3.fromRGB(22, 26, 36)
 	sliderBtn.BorderSizePixel = 0
 	sliderBtn.Text = ""
-	sliderBtn.AutoButtonColor = false
 	sliderBtn.Parent = row
 
 	local btnCorner = Instance.new("UICorner")
 	btnCorner.CornerRadius = UDim.new(0, 4)
 	btnCorner.Parent = sliderBtn
 
-	local btnStroke = Instance.new("UIStroke")
-	btnStroke.Color = Theme.CardStroke
-	btnStroke.Thickness = 1
-	btnStroke.Parent = sliderBtn
-
 	local btnIcon = Instance.new("ImageLabel")
-	btnIcon.Name = "Icon"
 	btnIcon.Size = UDim2.new(0, 12, 0, 12)
 	btnIcon.Position = UDim2.new(0.5, -6, 0.5, -6)
 	btnIcon.BackgroundTransparency = 1
@@ -1605,13 +1855,11 @@ function MidnightUI:CreateToggleWithSlider(parent, labelText, posY, defaultToggl
 	btnIcon.Parent = sliderBtn
 
 	local toggleBtn = Instance.new("TextButton")
-	toggleBtn.Name = "Toggle"
 	toggleBtn.Size = UDim2.new(0, 36, 0, 18)
 	toggleBtn.Position = UDim2.new(1, -36, 0.5, -9)
 	toggleBtn.BackgroundColor3 = defaultToggle and Theme.AccentBlue or Theme.ToggleOff
 	toggleBtn.BorderSizePixel = 0
 	toggleBtn.Text = ""
-	toggleBtn.AutoButtonColor = false
 	toggleBtn.Parent = row
 
 	local toggleCorner = Instance.new("UICorner")
@@ -1619,7 +1867,6 @@ function MidnightUI:CreateToggleWithSlider(parent, labelText, posY, defaultToggl
 	toggleCorner.Parent = toggleBtn
 
 	local knob = Instance.new("Frame")
-	knob.Name = "Knob"
 	knob.Size = UDim2.new(0, 12, 0, 12)
 	knob.Position = defaultToggle and UDim2.new(1, -15, 0.5, -6) or UDim2.new(0, 3, 0.5, -6)
 	knob.BackgroundColor3 = defaultToggle and Theme.AccentDark or Theme.ToggleKnob
@@ -1668,11 +1915,6 @@ function MidnightUI:CreateToggleWithSlider(parent, labelText, posY, defaultToggl
 		if invokeCallback and onToggleCallback then onToggleCallback(isToggled) end
 	end)
 
-	local setSliderValue = Instance.new("BindableEvent")
-	setSliderValue.Name = "SetSliderValue"
-	setSliderValue.Parent = row
-	setSliderValue.Event:Connect(applySliderVal)
-
 	toggleBtn.MouseButton1Click:Connect(function() setValue:Fire(not isToggled, true) end)
 	return row
 end
@@ -1681,14 +1923,12 @@ function MidnightUI:CreateToggleWithColorAndSlider(parent, labelText, posY, defa
 	step = step or 1
 	unit = unit or ""
 	local row = Instance.new("Frame")
-	row.Name = labelText:gsub("%s+", "") .. "Row"
 	row.Size = UDim2.new(1, -20, 0, 24)
 	row.Position = UDim2.new(0, 10, 0, posY)
 	row.BackgroundTransparency = 1
 	row.Parent = parent
 
 	local label = Instance.new("TextLabel")
-	label.Name = "Label"
 	label.Size = UDim2.new(1, -94, 1, 0)
 	label.BackgroundTransparency = 1
 	label.Text = labelText
@@ -1696,20 +1936,17 @@ function MidnightUI:CreateToggleWithColorAndSlider(parent, labelText, posY, defa
 	label.TextSize = 13
 	label.TextColor3 = Theme.TextPrimary
 	label.TextXAlignment = Enum.TextXAlignment.Left
-	label.TextTruncate = Enum.TextTruncate.AtEnd
 	label.Parent = row
 
 	local currentSliderVal = defaultSlider
 	local isToggled = defaultToggle == true
 
 	local sliderBtn = Instance.new("TextButton")
-	sliderBtn.Name = "SlidersBtn"
 	sliderBtn.Size = UDim2.new(0, 20, 0, 20)
 	sliderBtn.Position = UDim2.new(1, -88, 0.5, -10)
 	sliderBtn.BackgroundColor3 = Color3.fromRGB(22, 26, 36)
 	sliderBtn.BorderSizePixel = 0
 	sliderBtn.Text = ""
-	sliderBtn.AutoButtonColor = false
 	sliderBtn.Parent = row
 
 	local btnCorner = Instance.new("UICorner")
@@ -1717,7 +1954,6 @@ function MidnightUI:CreateToggleWithColorAndSlider(parent, labelText, posY, defa
 	btnCorner.Parent = sliderBtn
 
 	local btnIcon = Instance.new("ImageLabel")
-	btnIcon.Name = "Icon"
 	btnIcon.Size = UDim2.new(0, 12, 0, 12)
 	btnIcon.Position = UDim2.new(0.5, -6, 0.5, -6)
 	btnIcon.BackgroundTransparency = 1
@@ -1726,13 +1962,11 @@ function MidnightUI:CreateToggleWithColorAndSlider(parent, labelText, posY, defa
 	btnIcon.Parent = sliderBtn
 
 	local colorBox = Instance.new("TextButton")
-	colorBox.Name = "ColorBox"
 	colorBox.Size = UDim2.new(0, 18, 0, 18)
 	colorBox.Position = UDim2.new(1, -62, 0.5, -9)
 	colorBox.BackgroundColor3 = defaultColor or Color3.fromRGB(0, 245, 255)
 	colorBox.BorderSizePixel = 0
 	colorBox.Text = ""
-	colorBox.AutoButtonColor = false
 	colorBox.Parent = row
 
 	local colorCorner = Instance.new("UICorner")
@@ -1740,13 +1974,11 @@ function MidnightUI:CreateToggleWithColorAndSlider(parent, labelText, posY, defa
 	colorCorner.Parent = colorBox
 
 	local toggleBtn = Instance.new("TextButton")
-	toggleBtn.Name = "Toggle"
 	toggleBtn.Size = UDim2.new(0, 36, 0, 18)
 	toggleBtn.Position = UDim2.new(1, -36, 0.5, -9)
 	toggleBtn.BackgroundColor3 = defaultToggle and Theme.AccentBlue or Theme.ToggleOff
 	toggleBtn.BorderSizePixel = 0
 	toggleBtn.Text = ""
-	toggleBtn.AutoButtonColor = false
 	toggleBtn.Parent = row
 
 	local toggleCorner = Instance.new("UICorner")
@@ -1754,7 +1986,6 @@ function MidnightUI:CreateToggleWithColorAndSlider(parent, labelText, posY, defa
 	toggleCorner.Parent = toggleBtn
 
 	local knob = Instance.new("Frame")
-	knob.Name = "Knob"
 	knob.Size = UDim2.new(0, 12, 0, 12)
 	knob.Position = defaultToggle and UDim2.new(1, -15, 0.5, -6) or UDim2.new(0, 3, 0.5, -6)
 	knob.BackgroundColor3 = defaultToggle and Theme.AccentDark or Theme.ToggleKnob
@@ -1810,27 +2041,12 @@ function MidnightUI:CreateToggleWithColorAndSlider(parent, labelText, posY, defa
 		if invokeCallback and onToggleCallback then onToggleCallback(isToggled) end
 	end)
 
-	local setColor = Instance.new("BindableEvent")
-	setColor.Name = "SetColor"
-	setColor.Parent = row
-	setColor.Event:Connect(function(value, invokeCallback)
-		if typeof(value) ~= "Color3" then return end
-		colorBox.BackgroundColor3 = value
-		if invokeCallback and onColorCallback then onColorCallback(value) end
-	end)
-
-	local setSliderValue = Instance.new("BindableEvent")
-	setSliderValue.Name = "SetSliderValue"
-	setSliderValue.Parent = row
-	setSliderValue.Event:Connect(applySliderVal)
-
 	toggleBtn.MouseButton1Click:Connect(function() setValue:Fire(not isToggled, true) end)
 	return row
 end
 
 function MidnightUI:CreateChoiceSelector(parent, title, posY, choices, currentVal, callback)
 	local row = Instance.new("TextButton")
-	row.Name = title:gsub("%s+", "") .. "Row"
 	row.Size = UDim2.new(1, -20, 0, 28)
 	row.Position = UDim2.new(0, 10, 0, posY)
 	row.BackgroundColor3 = Theme.ToggleOff
@@ -1850,7 +2066,6 @@ function MidnightUI:CreateChoiceSelector(parent, title, posY, choices, currentVa
 	stroke.Parent = row
 
 	local titleLabel = Instance.new("TextLabel")
-	titleLabel.Name = "Title"
 	titleLabel.Size = UDim2.new(0.5, -10, 1, 0)
 	titleLabel.Position = UDim2.new(0, 10, 0, 0)
 	titleLabel.BackgroundTransparency = 1
@@ -1863,7 +2078,6 @@ function MidnightUI:CreateChoiceSelector(parent, title, posY, choices, currentVa
 	titleLabel.Parent = row
 
 	local valLabel = Instance.new("TextLabel")
-	valLabel.Name = "Value"
 	valLabel.Size = UDim2.new(0.5, -34, 1, 0)
 	valLabel.Position = UDim2.new(0.5, 0, 0, 0)
 	valLabel.BackgroundTransparency = 1
@@ -1872,18 +2086,15 @@ function MidnightUI:CreateChoiceSelector(parent, title, posY, choices, currentVa
 	valLabel.TextSize = 12
 	valLabel.TextColor3 = Theme.TextSecondary
 	valLabel.TextXAlignment = Enum.TextXAlignment.Right
-	valLabel.TextTruncate = Enum.TextTruncate.AtEnd
 	valLabel.ZIndex = 11
 	valLabel.Parent = row
 
 	local arrowIcon = Instance.new("ImageLabel")
-	arrowIcon.Name = "ArrowIcon"
 	arrowIcon.Size = UDim2.new(0, 12, 0, 12)
 	arrowIcon.Position = UDim2.new(1, -20, 0.5, -6)
 	arrowIcon.BackgroundTransparency = 1
 	arrowIcon.Image = self.Icons.Arrow
 	arrowIcon.ImageColor3 = Color3.fromRGB(150, 160, 180)
-	arrowIcon.Rotation = 0
 	arrowIcon.ZIndex = 11
 	arrowIcon.Parent = row
 
@@ -1894,7 +2105,6 @@ function MidnightUI:CreateChoiceSelector(parent, title, posY, choices, currentVa
 	local listH = 0
 
 	local dropdownList = Instance.new("Frame")
-	dropdownList.Name = title:gsub("%s+", "") .. "Dropdown"
 	dropdownList.Size = UDim2.new(1, -20, 0, 0)
 	dropdownList.Position = UDim2.new(0, 10, 0, posY + 31)
 	dropdownList.BackgroundColor3 = Color3.fromRGB(14, 17, 23)
@@ -1908,28 +2118,18 @@ function MidnightUI:CreateChoiceSelector(parent, title, posY, choices, currentVa
 	dropCorner.CornerRadius = UDim.new(0, 6)
 	dropCorner.Parent = dropdownList
 
-	local dropStroke = Instance.new("UIStroke")
-	dropStroke.Color = Theme.CardStroke
-	dropStroke.Thickness = 1
-	dropStroke.Parent = dropdownList
-
 	local choiceButtons = {}
 
 	local function closeThisDropdown(animated)
 		if not isDropOpen then return end
 		isDropOpen = false
-		if self.ActiveCloseDropdown == closeThisDropdown then
-			self.ActiveCloseDropdown = nil
-		end
+		if self.ActiveCloseDropdown == closeThisDropdown then self.ActiveCloseDropdown = nil end
 		local tweenInfo = TweenInfo.new(0.18, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
 		if animated then
 			TweenService:Create(arrowIcon, tweenInfo, { Rotation = 0, ImageColor3 = Color3.fromRGB(150, 160, 180) }):Play()
 			TweenService:Create(row, tweenInfo, { BackgroundColor3 = Theme.ToggleOff }):Play()
-			TweenService:Create(stroke, tweenInfo, { Color = Theme.CardStroke }):Play()
 			TweenService:Create(dropdownList, tweenInfo, { Size = UDim2.new(1, -20, 0, 0) }):Play()
-			task.delay(0.18, function()
-				if not isDropOpen then dropdownList.Visible = false end
-			end)
+			task.delay(0.18, function() if not isDropOpen then dropdownList.Visible = false end end)
 		else
 			arrowIcon.Rotation = 0
 			dropdownList.Size = UDim2.new(1, -20, 0, 0)
@@ -1939,25 +2139,18 @@ function MidnightUI:CreateChoiceSelector(parent, title, posY, choices, currentVa
 
 	local function openThisDropdown()
 		if isDropOpen then return end
-		if self.ActiveCloseDropdown then
-			pcall(self.ActiveCloseDropdown)
-			self.ActiveCloseDropdown = nil
-		end
+		if self.ActiveCloseDropdown then pcall(self.ActiveCloseDropdown) end
 		isDropOpen = true
 		self.ActiveCloseDropdown = closeThisDropdown
 		dropdownList.Visible = true
 		local tweenInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
 		TweenService:Create(arrowIcon, tweenInfo, { Rotation = 180, ImageColor3 = Theme.AccentWhite }):Play()
 		TweenService:Create(row, tweenInfo, { BackgroundColor3 = Color3.fromRGB(28, 34, 48) }):Play()
-		TweenService:Create(stroke, tweenInfo, { Color = Color3.fromRGB(80, 95, 125) }):Play()
 		TweenService:Create(dropdownList, tweenInfo, { Size = UDim2.new(1, -20, 0, listH) }):Play()
 	end
 
 	local function apply(idx, invoke)
-		if not choices or #choices == 0 then
-			valLabel.Text = ""
-			return
-		end
+		if not choices or #choices == 0 then return end
 		selected = math.clamp(idx, 1, #choices)
 		local currentChoice = choices[selected]
 		valLabel.Text = tostring(currentChoice or "")
@@ -1967,9 +2160,7 @@ function MidnightUI:CreateChoiceSelector(parent, title, posY, choices, currentVa
 			local dot = btn:FindFirstChild("Dot")
 			if dot then dot.Visible = isSel end
 		end
-		if invoke and callback and currentChoice ~= nil then
-			callback(currentChoice)
-		end
+		if invoke and callback and currentChoice ~= nil then callback(currentChoice) end
 	end
 
 	local function rebuildList(newChoices, defaultSelection)
@@ -1988,14 +2179,12 @@ function MidnightUI:CreateChoiceSelector(parent, title, posY, choices, currentVa
 		local container = dropdownList
 		if #choices > maxVisible then
 			local scroll = Instance.new("ScrollingFrame")
-			scroll.Name = "Scroll"
 			scroll.Size = UDim2.new(1, 0, 1, 0)
 			scroll.BackgroundTransparency = 1
 			scroll.BorderSizePixel = 0
 			scroll.ScrollBarThickness = 2
 			scroll.ScrollBarImageColor3 = Color3.fromRGB(80, 95, 125)
 			scroll.CanvasSize = UDim2.new(0, 0, 0, #choices * itemH + 4)
-			scroll.ClipsDescendants = true
 			scroll.ZIndex = 51
 			scroll.Parent = dropdownList
 			container = scroll
@@ -2004,7 +2193,6 @@ function MidnightUI:CreateChoiceSelector(parent, title, posY, choices, currentVa
 		table.clear(choiceButtons)
 		for i, ch in ipairs(choices) do
 			local optBtn = Instance.new("TextButton")
-			optBtn.Name = tostring(ch):gsub("%s+", "") .. "Option"
 			optBtn.Size = UDim2.new(1, 0, 0, itemH)
 			optBtn.Position = UDim2.new(0, 0, 0, (i - 1) * itemH + 2)
 			optBtn.BackgroundTransparency = 1
@@ -2014,7 +2202,6 @@ function MidnightUI:CreateChoiceSelector(parent, title, posY, choices, currentVa
 			optBtn.Parent = container
 
 			local optLabel = Instance.new("TextLabel")
-			optLabel.Name = "Label"
 			optLabel.Size = UDim2.new(1, -28, 1, 0)
 			optLabel.Position = UDim2.new(0, 24, 0, 0)
 			optLabel.BackgroundTransparency = 1
@@ -2023,7 +2210,6 @@ function MidnightUI:CreateChoiceSelector(parent, title, posY, choices, currentVa
 			optLabel.TextSize = 11
 			optLabel.TextColor3 = (i == selected) and Theme.AccentBlue or Theme.TextPrimary
 			optLabel.TextXAlignment = Enum.TextXAlignment.Left
-			optLabel.TextTruncate = Enum.TextTruncate.AtEnd
 			optLabel.ZIndex = 53
 			optLabel.Parent = optBtn
 
@@ -2041,12 +2227,6 @@ function MidnightUI:CreateChoiceSelector(parent, title, posY, choices, currentVa
 			dotCorner.CornerRadius = UDim.new(1, 0)
 			dotCorner.Parent = dot
 
-			optBtn.MouseEnter:Connect(function()
-				TweenService:Create(optBtn, TweenInfo.new(0.1), { BackgroundTransparency = 0.82, BackgroundColor3 = Color3.fromRGB(100, 140, 255) }):Play()
-			end)
-			optBtn.MouseLeave:Connect(function()
-				TweenService:Create(optBtn, TweenInfo.new(0.1), { BackgroundTransparency = 1 }):Play()
-			end)
 			optBtn.MouseButton1Click:Connect(function()
 				apply(i, true)
 				closeThisDropdown(true)
@@ -2101,83 +2281,61 @@ function MidnightUI:CreateChoiceSelector(parent, title, posY, choices, currentVa
 end
 
 -- ==========================================================
--- МОДАЛЬНЫЕ ОКНА: ЦВЕТ, ПОЛЗУНОК, БИНДЫ, КОНФИГИ
+-- МОДАЛКИ: COLOR PICKER, SLIDER POPOVER, CONFIG MANAGER
 -- ==========================================================
-
 function MidnightUI:_InitPopups(MainFrame)
-	-- 1. Slider Popover
+	-- Slider Popover
 	local SliderPopover = Instance.new("CanvasGroup")
-	SliderPopover.Name = "MidnightSliderPopover"
 	SliderPopover.Size = UDim2.new(0, 168, 0, 26)
 	SliderPopover.BackgroundColor3 = Color3.fromRGB(18, 22, 30)
 	SliderPopover.BorderSizePixel = 0
-	SliderPopover.GroupTransparency = 1
 	SliderPopover.Visible = false
 	SliderPopover.ZIndex = 85
 	SliderPopover.Parent = MainFrame
 
-	local popoverCorner = Instance.new("UICorner")
-	popoverCorner.CornerRadius = UDim.new(0, 6)
-	popoverCorner.Parent = SliderPopover
+	local pCorn = Instance.new("UICorner")
+	pCorn.CornerRadius = UDim.new(0, 6)
+	pCorn.Parent = SliderPopover
 
-	local popoverTrack = Instance.new("Frame")
-	popoverTrack.Name = "Track"
-	popoverTrack.Size = UDim2.new(1, -50, 0, 4)
-	popoverTrack.Position = UDim2.new(0, 8, 0.5, -2)
-	popoverTrack.BackgroundColor3 = Color3.fromRGB(28, 34, 46)
-	popoverTrack.BorderSizePixel = 0
-	popoverTrack.Parent = SliderPopover
+	local pTrack = Instance.new("Frame")
+	pTrack.Size = UDim2.new(1, -50, 0, 4)
+	pTrack.Position = UDim2.new(0, 8, 0.5, -2)
+	pTrack.BackgroundColor3 = Color3.fromRGB(28, 34, 46)
+	pTrack.BorderSizePixel = 0
+	pTrack.Parent = SliderPopover
 
-	local popoverTrackCorner = Instance.new("UICorner")
-	popoverTrackCorner.CornerRadius = UDim.new(1, 0)
-	popoverTrackCorner.Parent = popoverTrack
+	local pFill = Instance.new("Frame")
+	pFill.Size = UDim2.new(0.5, 0, 1, 0)
+	pFill.BackgroundColor3 = Theme.AccentWhite
+	pFill.BorderSizePixel = 0
+	pFill.Parent = pTrack
 
-	local popoverFill = Instance.new("Frame")
-	popoverFill.Name = "Fill"
-	popoverFill.Size = UDim2.new(0.5, 0, 1, 0)
-	popoverFill.BackgroundColor3 = Theme.AccentWhite
-	popoverFill.BorderSizePixel = 0
-	popoverFill.Parent = popoverTrack
+	local pThumb = Instance.new("Frame")
+	pThumb.Size = UDim2.new(0, 12, 0, 12)
+	pThumb.Position = UDim2.new(0.5, -6, 0.5, -6)
+	pThumb.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+	pThumb.BorderSizePixel = 0
+	pThumb.Parent = pTrack
+	local thCorn = Instance.new("UICorner")
+	thCorn.CornerRadius = UDim.new(1, 0)
+	thCorn.Parent = pThumb
 
-	local popoverFillCorner = Instance.new("UICorner")
-	popoverFillCorner.CornerRadius = UDim.new(1, 0)
-	popoverFillCorner.Parent = popoverFill
+	local pVal = Instance.new("TextLabel")
+	pVal.Size = UDim2.new(0, 38, 1, 0)
+	pVal.Position = UDim2.new(1, -40, 0, 0)
+	pVal.BackgroundTransparency = 1
+	pVal.Font = Theme.FontMedium
+	pVal.TextSize = 11
+	pVal.TextColor3 = Theme.TextPrimary
+	pVal.Parent = SliderPopover
 
-	local popoverThumb = Instance.new("Frame")
-	popoverThumb.Name = "Thumb"
-	popoverThumb.Size = UDim2.new(0, 12, 0, 12)
-	popoverThumb.Position = UDim2.new(0.5, -6, 0.5, -6)
-	popoverThumb.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-	popoverThumb.BorderSizePixel = 0
-	popoverThumb.Parent = popoverTrack
-
-	local popoverThumbCorner = Instance.new("UICorner")
-	popoverThumbCorner.CornerRadius = UDim.new(1, 0)
-	popoverThumbCorner.Parent = popoverThumb
-
-	local popoverValueLabel = Instance.new("TextLabel")
-	popoverValueLabel.Name = "ValueLabel"
-	popoverValueLabel.Size = UDim2.new(0, 38, 1, 0)
-	popoverValueLabel.Position = UDim2.new(1, -40, 0, 0)
-	popoverValueLabel.BackgroundTransparency = 1
-	popoverValueLabel.Font = Theme.FontSemiBold
-	popoverValueLabel.TextSize = 11
-	popoverValueLabel.TextColor3 = Theme.TextPrimary
-	popoverValueLabel.TextXAlignment = Enum.TextXAlignment.Center
-	popoverValueLabel.Parent = SliderPopover
-
-	local activeSliderSession = nil
-	local popoverDragInput = nil
-
+	local curSession = nil
 	local function closeSliderPopover(animated)
-		if not activeSliderSession then return end
-		activeSliderSession = nil
-		popoverDragInput = nil
+		if not curSession then return end
+		curSession = nil
 		if animated then
 			TweenService:Create(SliderPopover, TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { GroupTransparency = 1 }):Play()
-			task.delay(0.13, function()
-				if not activeSliderSession then SliderPopover.Visible = false end
-			end)
+			task.delay(0.13, function() if not curSession then SliderPopover.Visible = false end end)
 		else
 			SliderPopover.Visible = false
 			SliderPopover.GroupTransparency = 1
@@ -2185,144 +2343,77 @@ function MidnightUI:_InitPopups(MainFrame)
 	end
 	self.CloseSliderPopover = closeSliderPopover
 
-	local function updatePopoverSlider(inputX)
-		if not activeSliderSession then return end
-		local minVal, maxVal = activeSliderSession.Min, activeSliderSession.Max
-		local step = activeSliderSession.Step
-		local trackAbs = popoverTrack.AbsolutePosition
-		local trackW = math.max(popoverTrack.AbsoluteSize.X, 1)
-		local relX = math.clamp(inputX - trackAbs.X, 0, trackW)
-		local pct = relX / trackW
-		local rawVal = minVal + (maxVal - minVal) * pct
-		local finalVal = math.clamp(minVal + math.round((rawVal - minVal) / step) * step, minVal, maxVal)
-		finalVal = math.round(finalVal * 1000) / 1000
-
-		activeSliderSession.Value = finalVal
-		local newPct = math.clamp((finalVal - minVal) / math.max(maxVal - minVal, 1e-4), 0, 1)
-		popoverFill.Size = UDim2.new(newPct, 0, 1, 0)
-		popoverThumb.Position = UDim2.new(newPct, -6, 0.5, -6)
-		popoverValueLabel.Text = tostring(finalVal) .. activeSliderSession.Unit
-		if activeSliderSession.Callback then activeSliderSession.Callback(finalVal) end
-	end
-
-	local popoverClickDetector = Instance.new("TextButton")
-	popoverClickDetector.Name = "ClickDetector"
-	popoverClickDetector.Size = UDim2.new(1, -44, 1, 0)
-	popoverClickDetector.BackgroundTransparency = 1
-	popoverClickDetector.Text = ""
-	popoverClickDetector.ZIndex = 86
-	popoverClickDetector.Parent = SliderPopover
-
-	popoverClickDetector.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			popoverDragInput = input
-			updatePopoverSlider(input.Position.X)
-		end
-	end)
-
-	self:Connect(UserInputService.InputChanged, function(input)
-		if popoverDragInput and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-			updatePopoverSlider(input.Position.X)
-		end
-	end)
-
-	self:Connect(UserInputService.InputEnded, function(input)
-		if input == popoverDragInput then popoverDragInput = nil end
-	end)
-
-	self.OpenSliderPopover = function(_, anchorButton, minVal, maxVal, currentVal, unit, callback, step)
-		if activeSliderSession and activeSliderSession.Button == anchorButton then
+	self.OpenSliderPopover = function(_, btn, minVal, maxVal, curVal, unit, cb, step)
+		if curSession and curSession.Button == btn then
 			closeSliderPopover(true)
 			return
 		end
-		if self.CloseColorPicker then self.CloseColorPicker(true) end
-		if self.CloseKeybindPopup then self.CloseKeybindPopup(false) end
+		curSession = { Button = btn, Min = minVal, Max = maxVal, Unit = unit or "", Step = step or 1, Callback = cb }
+		local pct = math.clamp((curVal - minVal) / (maxVal - minVal), 0, 1)
+		pFill.Size = UDim2.new(pct, 0, 1, 0)
+		pThumb.Position = UDim2.new(pct, -6, 0.5, -6)
+		pVal.Text = tostring(curVal) .. curSession.Unit
 
-		local number = tonumber(currentVal) or minVal
-		step = step or 1
-		unit = unit or ""
-
-		activeSliderSession = {
-			Button = anchorButton,
-			Min = minVal,
-			Max = maxVal,
-			Value = number,
-			Unit = unit,
-			Step = step,
-			Callback = callback,
-		}
-
-		local pct = math.clamp((number - minVal) / math.max(maxVal - minVal, 1e-4), 0, 1)
-		popoverFill.Size = UDim2.new(pct, 0, 1, 0)
-		popoverThumb.Position = UDim2.new(pct, -6, 0.5, -6)
-		popoverValueLabel.Text = tostring(number) .. unit
-
-		local btnAbs = anchorButton.AbsolutePosition
-		local mainAbs = MainFrame.AbsolutePosition
-		local relX = btnAbs.X - mainAbs.X
-		local relY = btnAbs.Y - mainAbs.Y
-		local targetX = relX + anchorButton.AbsoluteSize.X + 6
-		if targetX + 168 > MainFrame.AbsoluteSize.X - 6 then targetX = relX - 168 - 6 end
-		targetX = math.clamp(targetX, 6, math.max(6, MainFrame.AbsoluteSize.X - 174))
-		local targetY = math.clamp(relY + (anchorButton.AbsoluteSize.Y - 26) / 2, 6, math.max(6, MainFrame.AbsoluteSize.Y - 32))
-
-		SliderPopover.Position = UDim2.new(0, targetX, 0, targetY)
+		local bPos = btn.AbsolutePosition - MainFrame.AbsolutePosition
+		SliderPopover.Position = UDim2.new(0, math.clamp(bPos.X + 26, 6, MainFrame.AbsoluteSize.X - 174), 0, math.clamp(bPos.Y - 2, 6, MainFrame.AbsoluteSize.Y - 32))
 		SliderPopover.Visible = true
-		SliderPopover.GroupTransparency = 1
-		TweenService:Create(SliderPopover, TweenInfo.new(0.14, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out), { GroupTransparency = 0 }):Play()
+		SliderPopover.GroupTransparency = 0
 	end
 
-	-- 2. Color Picker Modal
-	local activeColorPickerPopup = nil
+	local sDrag = false
+	SliderPopover.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			sDrag = true
+			local rel = math.clamp((input.Position.X - pTrack.AbsolutePosition.X) / pTrack.AbsoluteSize.X, 0, 1)
+			local raw = curSession.Min + (curSession.Max - curSession.Min) * rel
+			local final = math.clamp(curSession.Min + math.round((raw - curSession.Min) / curSession.Step) * curSession.Step, curSession.Min, curSession.Max)
+			final = math.round(final * 1000) / 1000
+			pFill.Size = UDim2.new(rel, 0, 1, 0)
+			pThumb.Position = UDim2.new(rel, -6, 0.5, -6)
+			pVal.Text = tostring(final) .. curSession.Unit
+			if curSession.Callback then curSession.Callback(final) end
+		end
+	end)
+	self:Connect(UserInputService.InputEnded, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			sDrag = false
+		end
+	end)
+
+	-- HSV Color Picker
+	local activeColorPicker = nil
 	local function closeColorPicker(animated)
-		local popup = activeColorPickerPopup
-		if not popup then return end
-		activeColorPickerPopup = nil
-		if animated and popup.Parent then
-			TweenService:Create(popup, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { GroupTransparency = 1 }):Play()
-			task.delay(0.15, function() if popup.Parent then popup:Destroy() end end)
+		if not activeColorPicker then return end
+		local p = activeColorPicker
+		activeColorPicker = nil
+		if animated then
+			TweenService:Create(p, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { GroupTransparency = 1 }):Play()
+			task.delay(0.15, function() p:Destroy() end)
 		else
-			popup:Destroy()
+			p:Destroy()
 		end
 	end
 	self.CloseColorPicker = closeColorPicker
 
-	self.OpenColorPicker = function(_, initialColor, onColorChanged)
+	self.OpenColorPicker = function(_, initCol, onCol)
 		closeColorPicker(false)
-		if self.CloseSliderPopover then self.CloseSliderPopover(false) end
-		if self.CloseKeybindPopup then self.CloseKeybindPopup(false) end
+		local curH, curS, curV = (initCol or Color3.new(1, 1, 1)):ToHSV()
 
-		local curH, curS, curV = 0, 1, 1
-		if typeof(initialColor) == "Color3" then curH, curS, curV = initialColor:ToHSV() end
+		local picker = Instance.new("CanvasGroup")
+		picker.Size = UDim2.new(0, 230, 0, 230)
+		picker.Position = UDim2.new(0.5, -115, 0.5, -115)
+		picker.BackgroundColor3 = Color3.fromRGB(16, 20, 27)
+		picker.BorderSizePixel = 0
+		picker.ZIndex = 60
+		picker.Parent = MainFrame
+		activeColorPicker = picker
 
-		local popup = Instance.new("CanvasGroup")
-		popup.Name = "MidnightColorPicker"
-		popup.Size = UDim2.new(0, 230, 0, 230)
-		popup.Position = UDim2.new(0.5, -115, 0.5, -115)
-		popup.BackgroundColor3 = Color3.fromRGB(16, 20, 27)
-		popup.BorderSizePixel = 0
-		popup.ZIndex = 60
-		popup.GroupTransparency = 1
-		popup.Parent = MainFrame
-		activeColorPickerPopup = popup
-
-		local popupCorner = Instance.new("UICorner")
-		popupCorner.CornerRadius = UDim.new(0, 8)
-		popupCorner.Parent = popup
-
-		local popupStroke = Instance.new("UIStroke")
-		popupStroke.Color = Theme.CardStroke
-		popupStroke.Thickness = 1.5
-		popupStroke.Parent = popup
-
-		local header = Instance.new("Frame")
-		header.Size = UDim2.new(1, 0, 0, 28)
-		header.BackgroundTransparency = 1
-		header.ZIndex = 61
-		header.Parent = popup
+		local pCorn = Instance.new("UICorner")
+		pCorn.CornerRadius = UDim.new(0, 8)
+		pCorn.Parent = picker
 
 		local title = Instance.new("TextLabel")
-		title.Size = UDim2.new(1, -40, 1, 0)
+		title.Size = UDim2.new(1, -40, 0, 28)
 		title.Position = UDim2.new(0, 12, 0, 0)
 		title.BackgroundTransparency = 1
 		title.Text = "Color Spectrum"
@@ -2330,19 +2421,17 @@ function MidnightUI:_InitPopups(MainFrame)
 		title.TextSize = 12
 		title.TextColor3 = Theme.TextPrimary
 		title.TextXAlignment = Enum.TextXAlignment.Left
-		title.ZIndex = 61
-		title.Parent = header
+		title.Parent = picker
 
 		local closeBtn = Instance.new("TextButton")
 		closeBtn.Size = UDim2.new(0, 22, 0, 22)
-		closeBtn.Position = UDim2.new(1, -28, 0.5, -11)
+		closeBtn.Position = UDim2.new(1, -28, 0, 3)
 		closeBtn.BackgroundTransparency = 1
 		closeBtn.Text = "✕"
 		closeBtn.TextColor3 = Theme.TextSecondary
 		closeBtn.Font = Theme.FontBold
 		closeBtn.TextSize = 12
-		closeBtn.ZIndex = 62
-		closeBtn.Parent = header
+		closeBtn.Parent = picker
 		closeBtn.MouseButton1Click:Connect(function() closeColorPicker(true) end)
 
 		local svCanvas = Instance.new("Frame")
@@ -2350,61 +2439,41 @@ function MidnightUI:_InitPopups(MainFrame)
 		svCanvas.Position = UDim2.new(0, 13, 0, 30)
 		svCanvas.BackgroundColor3 = Color3.fromHSV(curH, 1, 1)
 		svCanvas.BorderSizePixel = 0
-		svCanvas.ZIndex = 61
 		svCanvas.ClipsDescendants = true
-		svCanvas.Parent = popup
+		svCanvas.Parent = picker
 
-		local svCorner = Instance.new("UICorner")
-		svCorner.CornerRadius = UDim.new(0, 4)
-		svCorner.Parent = svCanvas
-
-		local whiteGradFrame = Instance.new("Frame")
-		whiteGradFrame.Size = UDim2.new(1, 0, 1, 0)
-		whiteGradFrame.BackgroundColor3 = Color3.new(1, 1, 1)
-		whiteGradFrame.BorderSizePixel = 0
-		whiteGradFrame.ZIndex = 62
-		whiteGradFrame.Parent = svCanvas
+		local wFrame = Instance.new("Frame")
+		wFrame.Size = UDim2.new(1, 0, 1, 0)
+		wFrame.BackgroundColor3 = Color3.new(1, 1, 1)
+		wFrame.BorderSizePixel = 0
+		wFrame.Parent = svCanvas
 		local whiteGrad = Instance.new("UIGradient")
 		whiteGrad.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(1, 1)})
-		whiteGrad.Parent = whiteGradFrame
+		whiteGrad.Parent = wFrame
 
-		local blackGradFrame = Instance.new("Frame")
-		blackGradFrame.Size = UDim2.new(1, 0, 1, 0)
-		blackGradFrame.BackgroundColor3 = Color3.new(0, 0, 0)
-		blackGradFrame.BorderSizePixel = 0
-		blackGradFrame.ZIndex = 63
-		blackGradFrame.Parent = svCanvas
+		local bFrame = Instance.new("Frame")
+		bFrame.Size = UDim2.new(1, 0, 1, 0)
+		bFrame.BackgroundColor3 = Color3.new(0, 0, 0)
+		bFrame.BorderSizePixel = 0
+		bFrame.Parent = svCanvas
 		local blackGrad = Instance.new("UIGradient")
 		blackGrad.Rotation = 90
 		blackGrad.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0)})
-		blackGrad.Parent = blackGradFrame
-
-		local svCursor = Instance.new("Frame")
-		svCursor.Size = UDim2.new(0, 10, 0, 10)
-		svCursor.Position = UDim2.new(curS, -5, 1 - curV, -5)
-		svCursor.BackgroundColor3 = Color3.new(1, 1, 1)
-		svCursor.BorderSizePixel = 0
-		svCursor.ZIndex = 65
-		svCursor.Parent = svCanvas
-
-		local cursorCorner = Instance.new("UICorner")
-		cursorCorner.CornerRadius = UDim.new(1, 0)
-		cursorCorner.Parent = svCursor
+		blackGrad.Parent = bFrame
 
 		local hueTrack = Instance.new("Frame")
 		hueTrack.Size = UDim2.new(0, 204, 0, 14)
 		hueTrack.Position = UDim2.new(0, 13, 0, 132)
 		hueTrack.BackgroundColor3 = Color3.new(1, 1, 1)
 		hueTrack.BorderSizePixel = 0
-		hueTrack.ZIndex = 61
-		hueTrack.Parent = popup
+		hueTrack.Parent = picker
 
-		local hueCorner = Instance.new("UICorner")
-		hueCorner.CornerRadius = UDim.new(0, 4)
-		hueCorner.Parent = hueTrack
+		local hCorn = Instance.new("UICorner")
+		hCorn.CornerRadius = UDim.new(0, 4)
+		hCorn.Parent = hueTrack
 
-		local hueGrad = Instance.new("UIGradient")
-		hueGrad.Color = ColorSequence.new({
+		local hGrad = Instance.new("UIGradient")
+		hGrad.Color = ColorSequence.new({
 			ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 0, 0)),
 			ColorSequenceKeypoint.new(0.17, Color3.fromRGB(255, 255, 0)),
 			ColorSequenceKeypoint.new(0.33, Color3.fromRGB(0, 255, 0)),
@@ -2413,172 +2482,66 @@ function MidnightUI:_InitPopups(MainFrame)
 			ColorSequenceKeypoint.new(0.83, Color3.fromRGB(255, 0, 255)),
 			ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 0, 0)),
 		})
-		hueGrad.Parent = hueTrack
+		hGrad.Parent = hueTrack
 
-		local hueCursor = Instance.new("Frame")
-		hueCursor.Size = UDim2.new(0, 8, 1, 4)
-		hueCursor.Position = UDim2.new(curH, -4, 0, -2)
-		hueCursor.BackgroundColor3 = Color3.new(1, 1, 1)
-		hueCursor.BorderSizePixel = 0
-		hueCursor.ZIndex = 65
-		hueCursor.Parent = hueTrack
+		local prevBox = Instance.new("Frame")
+		prevBox.Size = UDim2.new(0, 22, 0, 22)
+		prevBox.Position = UDim2.new(0, 13, 0, 154)
+		prevBox.BackgroundColor3 = Color3.fromHSV(curH, curS, curV)
+		prevBox.BorderSizePixel = 0
+		prevBox.Parent = picker
 
-		local previewRow = Instance.new("Frame")
-		previewRow.Size = UDim2.new(0, 204, 0, 22)
-		previewRow.Position = UDim2.new(0, 13, 0, 154)
-		previewRow.BackgroundTransparency = 1
-		previewRow.ZIndex = 61
-		previewRow.Parent = popup
+		local hexLbl = Instance.new("TextLabel")
+		hexLbl.Size = UDim2.new(1, -50, 0, 22)
+		hexLbl.Position = UDim2.new(0, 42, 0, 154)
+		hexLbl.BackgroundTransparency = 1
+		hexLbl.Font = Theme.FontMedium
+		hexLbl.TextSize = 12
+		hexLbl.TextColor3 = Theme.TextPrimary
+		hexLbl.TextXAlignment = Enum.TextXAlignment.Left
+		hexLbl.Parent = picker
 
-		local colorPreview = Instance.new("Frame")
-		colorPreview.Size = UDim2.new(0, 22, 0, 22)
-		colorPreview.BackgroundColor3 = Color3.fromHSV(curH, curS, curV)
-		colorPreview.BorderSizePixel = 0
-		colorPreview.ZIndex = 62
-		colorPreview.Parent = previewRow
-
-		local prevCorner = Instance.new("UICorner")
-		prevCorner.CornerRadius = UDim.new(0, 4)
-		prevCorner.Parent = colorPreview
-
-		local hexLabel = Instance.new("TextLabel")
-		hexLabel.Size = UDim2.new(1, -30, 1, 0)
-		hexLabel.Position = UDim2.new(0, 28, 0, 0)
-		hexLabel.BackgroundTransparency = 1
-		hexLabel.Font = Theme.FontMedium
-		hexLabel.TextSize = 12
-		hexLabel.TextColor3 = Theme.TextPrimary
-		hexLabel.TextXAlignment = Enum.TextXAlignment.Left
-		hexLabel.ZIndex = 62
-		hexLabel.Parent = previewRow
-
-		local function updateColorPreview()
-			local color = Color3.fromHSV(curH, curS, curV)
-			colorPreview.BackgroundColor3 = color
-			local r = math.round(color.R * 255)
-			local g = math.round(color.G * 255)
-			local b = math.round(color.B * 255)
-			hexLabel.Text = string.format("#%02X%02X%02X (%d, %d, %d)", r, g, b, r, g, b)
+		local function updateCol()
+			local c = Color3.fromHSV(curH, curS, curV)
+			prevBox.BackgroundColor3 = c
 			svCanvas.BackgroundColor3 = Color3.fromHSV(curH, 1, 1)
-			if onColorChanged then onColorChanged(color) end
+			hexLbl.Text = string.format("#%02X%02X%02X (%d, %d, %d)", c.R*255, c.G*255, c.B*255, c.R*255, c.G*255, c.B*255)
+			if onCol then onCol(c) end
 		end
-		updateColorPreview()
-
-		local paletteRow = Instance.new("Frame")
-		paletteRow.Size = UDim2.new(0, 204, 0, 20)
-		paletteRow.Position = UDim2.new(0, 13, 0, 184)
-		paletteRow.BackgroundTransparency = 1
-		paletteRow.ZIndex = 61
-		paletteRow.Parent = popup
-
-		local paletteColors = {
-			Color3.fromRGB(255, 55, 55), Color3.fromRGB(255, 140, 30), Color3.fromRGB(255, 225, 45),
-			Color3.fromRGB(50, 225, 80), Color3.fromRGB(0, 235, 255), Color3.fromRGB(45, 145, 255),
-			Color3.fromRGB(195, 75, 255), Color3.fromRGB(255, 255, 255),
-		}
-
-		for pIdx, pColor in ipairs(paletteColors) do
-			local swatch = Instance.new("TextButton")
-			swatch.Size = UDim2.new(0, 18, 0, 18)
-			swatch.Position = UDim2.new(0, (pIdx - 1) * 26, 0, 1)
-			swatch.BackgroundColor3 = pColor
-			swatch.BorderSizePixel = 0
-			swatch.Text = ""
-			swatch.AutoButtonColor = false
-			swatch.ZIndex = 62
-			swatch.Parent = paletteRow
-
-			local sCorner = Instance.new("UICorner")
-			sCorner.CornerRadius = UDim.new(1, 0)
-			sCorner.Parent = swatch
-
-			swatch.MouseButton1Click:Connect(function()
-				curH, curS, curV = pColor:ToHSV()
-				svCursor.Position = UDim2.new(curS, -5, 1 - curV, -5)
-				hueCursor.Position = UDim2.new(curH, -4, 0, -2)
-				updateColorPreview()
-			end)
-		end
-
-		local dragInput, dragSerial, dragMode
-		local function updateSV(pos)
-			local rx = math.clamp(pos.X - svCanvas.AbsolutePosition.X, 0, svCanvas.AbsoluteSize.X)
-			local ry = math.clamp(pos.Y - svCanvas.AbsolutePosition.Y, 0, svCanvas.AbsoluteSize.Y)
-			curS = rx / math.max(svCanvas.AbsoluteSize.X, 1)
-			curV = 1 - (ry / math.max(svCanvas.AbsoluteSize.Y, 1))
-			svCursor.Position = UDim2.new(curS, -5, 1 - curV, -5)
-			updateColorPreview()
-		end
-
-		local function updateHue(pos)
-			local rx = math.clamp(pos.X - hueTrack.AbsolutePosition.X, 0, hueTrack.AbsoluteSize.X)
-			curH = rx / math.max(hueTrack.AbsoluteSize.X, 1)
-			hueCursor.Position = UDim2.new(curH, -4, 0, -2)
-			updateColorPreview()
-		end
+		updateCol()
 
 		svCanvas.InputBegan:Connect(function(input)
 			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-				dragInput, dragSerial, dragMode = input, MidnightUI.PointerSerial, "SV"
-				updateSV(input.Position)
+				curS = math.clamp((input.Position.X - svCanvas.AbsolutePosition.X) / svCanvas.AbsoluteSize.X, 0, 1)
+				curV = math.clamp(1 - (input.Position.Y - svCanvas.AbsolutePosition.Y) / svCanvas.AbsoluteSize.Y, 0, 1)
+				updateCol()
 			end
 		end)
 
 		hueTrack.InputBegan:Connect(function(input)
 			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-				dragInput, dragSerial, dragMode = input, MidnightUI.PointerSerial, "Hue"
-				updateHue(input.Position)
+				curH = math.clamp((input.Position.X - hueTrack.AbsolutePosition.X) / hueTrack.AbsoluteSize.X, 0, 1)
+				updateCol()
 			end
 		end)
-
-		local changeConn = UserInputService.InputChanged:Connect(function(input)
-			if activeColorPickerPopup == popup and isPointerMovement(input, dragInput, dragSerial) then
-				if dragMode == "SV" then updateSV(input.Position) elseif dragMode == "Hue" then updateHue(input.Position) end
-			end
-		end)
-
-		popup.Destroying:Connect(function() changeConn:Disconnect() end)
-		TweenService:Create(popup, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { GroupTransparency = 0 }):Play()
 	end
 
-	-- 3. Keybind Modal
-	self.CloseKeybindPopup = function()
-		local p = self.KeybindPopup.Window
-		self.KeybindPopup.Capturing = false
-		if self.KeybindPopup.Connection then
-			self.KeybindPopup.Connection:Disconnect()
-			self.KeybindPopup.Connection = nil
-		end
-		if p then p:Destroy() end
-		self.KeybindPopup.Window = nil
-	end
-
-	self.OpenKeybindPopup = function(_, currentKey, onChanged)
-		self.CloseKeybindPopup()
-		if self.CloseColorPicker then self.CloseColorPicker(false) end
-		if self.CloseSliderPopover then self.CloseSliderPopover(false) end
-
+	-- Keybind Modal
+	self.OpenKeybindPopup = function(_, curKey, onChg)
 		local popup = Instance.new("Frame")
-		popup.Name = "MidnightKeybindPopup"
 		popup.Size = UDim2.new(0, 224, 0, 122)
 		popup.Position = UDim2.new(0.5, -112, 0.5, -61)
 		popup.BackgroundColor3 = Color3.fromRGB(16, 20, 27)
 		popup.BorderSizePixel = 0
 		popup.ZIndex = 80
 		popup.Parent = MainFrame
-		self.KeybindPopup.Window = popup
 
 		local corner = Instance.new("UICorner")
 		corner.CornerRadius = UDim.new(0, 8)
 		corner.Parent = popup
 
-		local stroke = Instance.new("UIStroke")
-		stroke.Color = Theme.CardStroke
-		stroke.Thickness = 1
-		stroke.Parent = popup
-
 		local title = Instance.new("TextLabel")
-		title.Size = UDim2.new(1, -42, 0, 30)
+		title.Size = UDim2.new(1, -40, 0, 30)
 		title.Position = UDim2.new(0, 12, 0, 2)
 		title.BackgroundTransparency = 1
 		title.Text = "Keybind"
@@ -2586,7 +2549,6 @@ function MidnightUI:_InitPopups(MainFrame)
 		title.TextSize = 12
 		title.TextColor3 = Theme.TextPrimary
 		title.TextXAlignment = Enum.TextXAlignment.Left
-		title.ZIndex = 81
 		title.Parent = popup
 
 		local closeBtn = Instance.new("TextButton")
@@ -2595,101 +2557,74 @@ function MidnightUI:_InitPopups(MainFrame)
 		closeBtn.BackgroundTransparency = 1
 		closeBtn.Text = "✕"
 		closeBtn.TextColor3 = Theme.TextSecondary
-		closeBtn.Font = Theme.FontBold
-		closeBtn.TextSize = 12
-		closeBtn.ZIndex = 82
 		closeBtn.Parent = popup
-		closeBtn.MouseButton1Click:Connect(self.CloseKeybindPopup)
+		closeBtn.MouseButton1Click:Connect(function() popup:Destroy() end)
 
 		local keyBtn = Instance.new("TextButton")
 		keyBtn.Size = UDim2.new(0, 68, 0, 28)
 		keyBtn.Position = UDim2.new(1, -80, 0, 39)
 		keyBtn.BackgroundColor3 = Theme.NavActive
 		keyBtn.BorderSizePixel = 0
-		keyBtn.Text = string.upper(tostring(currentKey))
+		keyBtn.Text = string.upper(tostring(curKey))
 		keyBtn.Font = Theme.FontSemiBold
 		keyBtn.TextSize = 12
 		keyBtn.TextColor3 = Theme.AccentBlue
-		keyBtn.AutoButtonColor = false
-		keyBtn.ZIndex = 82
 		keyBtn.Parent = popup
 
-		local keyCorner = Instance.new("UICorner")
-		keyCorner.CornerRadius = UDim.new(0, 6)
-		keyCorner.Parent = keyBtn
+		local kCorn = Instance.new("UICorner")
+		kCorn.CornerRadius = UDim.new(0, 6)
+		kCorn.Parent = keyBtn
 
-		local hint = Instance.new("TextLabel")
-		hint.Size = UDim2.new(1, -24, 0, 32)
-		hint.Position = UDim2.new(0, 12, 0, 79)
-		hint.BackgroundTransparency = 1
-		hint.Text = "Click the bind, then press a key"
-		hint.Font = Theme.FontRegular
-		hint.TextSize = 10
-		hint.TextColor3 = Theme.TextSecondary
-		hint.TextWrapped = true
-		hint.TextXAlignment = Enum.TextXAlignment.Left
-		hint.ZIndex = 81
-		hint.Parent = popup
-
+		local capturing = false
 		keyBtn.MouseButton1Click:Connect(function()
-			self.KeybindPopup.Capturing = true
+			capturing = true
 			keyBtn.Text = "..."
 			keyBtn.TextColor3 = Color3.fromRGB(255, 205, 65)
-			hint.Text = "Press a keyboard key - Esc to cancel"
 		end)
 
-		self.KeybindPopup.Connection = UserInputService.InputBegan:Connect(function(input)
-			if not self.KeybindPopup.Capturing or input.UserInputType ~= Enum.UserInputType.Keyboard then return end
-			local keyCode = input.KeyCode
-			if keyCode == Enum.KeyCode.Escape then
-				self.KeybindPopup.Capturing = false
-				keyBtn.Text = string.upper(tostring(currentKey))
-				keyBtn.TextColor3 = Theme.AccentBlue
-				hint.Text = "Click the bind, then press a key"
-				return
+		local conn
+		conn = UserInputService.InputBegan:Connect(function(input)
+			if capturing and input.UserInputType == Enum.UserInputType.Keyboard then
+				if input.KeyCode ~= Enum.KeyCode.Escape then
+					curKey = input.KeyCode.Name
+					keyBtn.Text = string.upper(curKey)
+					keyBtn.TextColor3 = Theme.AccentBlue
+					if onChg then onChg(curKey) end
+				else
+					keyBtn.Text = string.upper(curKey)
+					keyBtn.TextColor3 = Theme.AccentBlue
+				end
+				capturing = false
 			end
-			currentKey = keyCode.Name
-			self.KeybindPopup.Capturing = false
-			keyBtn.Text = string.upper(currentKey)
-			keyBtn.TextColor3 = Theme.AccentBlue
-			hint.Text = "Bind updated"
-			if onChanged then onChanged(currentKey) end
 		end)
+		popup.Destroying:Connect(function() conn:Disconnect() end)
 	end
 
-	-- 4. Config Picker Modal
-	local function buildConfigPicker()
-		local picker = Instance.new("CanvasGroup")
-		picker.Name = "ConfigPicker"
-		picker.Size = UDim2.new(0, 336, 0, 318)
-		picker.Position = UDim2.new(0.5, -168, 0.5, -159)
-		picker.BackgroundColor3 = Color3.fromRGB(14, 18, 25)
-		picker.BorderSizePixel = 0
-		picker.GroupTransparency = 1
-		picker.Visible = false
-		picker.ZIndex = 70
-		picker.Parent = MainFrame
+	-- Config Browser Modal
+	local function buildConfigModal()
+		local modal = Instance.new("CanvasGroup")
+		modal.Size = UDim2.new(0, 336, 0, 318)
+		modal.Position = UDim2.new(0.5, -168, 0.5, -159)
+		modal.BackgroundColor3 = Color3.fromRGB(14, 18, 25)
+		modal.BorderSizePixel = 0
+		modal.Visible = false
+		modal.ZIndex = 70
+		modal.Parent = MainFrame
 
-		local corner = Instance.new("UICorner")
-		corner.CornerRadius = UDim.new(0, 9)
-		corner.Parent = picker
-
-		local stroke = Instance.new("UIStroke")
-		stroke.Color = Theme.CardStroke
-		stroke.Thickness = 1.5
-		stroke.Parent = picker
+		local mCorn = Instance.new("UICorner")
+		mCorn.CornerRadius = UDim.new(0, 8)
+		mCorn.Parent = modal
 
 		local title = Instance.new("TextLabel")
 		title.Size = UDim2.new(1, -54, 0, 42)
 		title.Position = UDim2.new(0, 14, 0, 0)
 		title.BackgroundTransparency = 1
 		title.Text = "SAVED CONFIGS"
-		title.Font = Theme.FontSemiBold
+		title.Font = Theme.FontBold
 		title.TextSize = 13
 		title.TextColor3 = Theme.TextPrimary
 		title.TextXAlignment = Enum.TextXAlignment.Left
-		title.ZIndex = 71
-		title.Parent = picker
+		title.Parent = modal
 
 		local closeBtn = Instance.new("TextButton")
 		closeBtn.Size = UDim2.new(0, 24, 0, 24)
@@ -2697,10 +2632,8 @@ function MidnightUI:_InitPopups(MainFrame)
 		closeBtn.BackgroundTransparency = 1
 		closeBtn.Text = "✕"
 		closeBtn.TextColor3 = Theme.TextSecondary
-		closeBtn.Font = Theme.FontBold
-		closeBtn.TextSize = 13
-		closeBtn.ZIndex = 72
-		closeBtn.Parent = picker
+		closeBtn.Parent = modal
+		closeBtn.MouseButton1Click:Connect(function() modal.Visible = false end)
 
 		local list = Instance.new("ScrollingFrame")
 		list.Size = UDim2.new(1, -28, 0, 202)
@@ -2709,23 +2642,18 @@ function MidnightUI:_InitPopups(MainFrame)
 		list.BorderSizePixel = 0
 		list.ScrollBarThickness = 4
 		list.ScrollBarImageColor3 = Theme.AccentBlue
-		list.ZIndex = 71
-		list.Parent = picker
+		list.Parent = modal
 
-		local listLayout = Instance.new("UIListLayout")
-		listLayout.Padding = UDim.new(0, 5)
-		listLayout.Parent = list
+		local lLayout = Instance.new("UIListLayout")
+		lLayout.Padding = UDim.new(0, 5)
+		lLayout.Parent = list
 
-		local selectedName = nil
-		local selectedBtn = nil
-
+		local selName, selBtn
 		local function refresh()
-			for _, child in ipairs(list:GetChildren()) do
-				if child:IsA("TextButton") then child:Destroy() end
-			end
-			selectedName, selectedBtn = nil, nil
+			for _, ch in ipairs(list:GetChildren()) do if ch:IsA("TextButton") then ch:Destroy() end end
+			selName, selBtn = nil, nil
 			local names = {}
-			if fileApi.listfiles and fileApi.isfolder and fileApi.isfolder(self.ConfigFolder) then
+			if fileApi.listfiles and self:EnsureConfigFolder() then
 				local ok, files = pcall(fileApi.listfiles, self.ConfigFolder)
 				if ok and type(files) == "table" then
 					for _, f in ipairs(files) do
@@ -2745,21 +2673,19 @@ function MidnightUI:_InitPopups(MainFrame)
 				row.TextSize = 12
 				row.TextColor3 = Theme.TextPrimary
 				row.TextXAlignment = Enum.TextXAlignment.Left
-				row.AutoButtonColor = false
-				row.ZIndex = 72
 				row.Parent = list
 
-				local rCorner = Instance.new("UICorner")
-				rCorner.CornerRadius = UDim.new(0, 5)
-				rCorner.Parent = row
+				local rCorn = Instance.new("UICorner")
+				rCorn.CornerRadius = UDim.new(0, 5)
+				rCorn.Parent = row
 
 				row.MouseButton1Click:Connect(function()
-					if selectedBtn and selectedBtn.Parent then
-						selectedBtn.BackgroundColor3 = Color3.fromRGB(18, 23, 31)
-						selectedBtn.TextColor3 = Theme.TextPrimary
+					if selBtn and selBtn.Parent then
+						selBtn.BackgroundColor3 = Color3.fromRGB(18, 23, 31)
+						selBtn.TextColor3 = Theme.TextPrimary
 					end
-					selectedName = name
-					selectedBtn = row
+					selName = name
+					selBtn = row
 					row.BackgroundColor3 = Theme.NavActive
 					row.TextColor3 = Theme.AccentBlue
 				end)
@@ -2767,31 +2693,13 @@ function MidnightUI:_InitPopups(MainFrame)
 			list.CanvasSize = UDim2.new(0, 0, 0, #names * 37)
 		end
 
-		local function open()
+		self.OpenConfigPicker = function()
 			refresh()
-			picker.Visible = true
-			TweenService:Create(picker, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { GroupTransparency = 0 }):Play()
+			modal.Visible = true
 		end
-
-		local function close(animated)
-			if not picker.Visible then return end
-			if animated then
-				TweenService:Create(picker, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { GroupTransparency = 1 }):Play()
-				task.delay(0.15, function() picker.Visible = false end)
-			else
-				picker.Visible = false
-				picker.GroupTransparency = 1
-			end
-		end
-
-		closeBtn.MouseButton1Click:Connect(function() close(true) end)
-		return open, close, refresh
+		self.RefreshConfigPicker = refresh
 	end
-
-	local openConfig, closeConfig, refreshConfig = buildConfigPicker()
-	self.OpenConfigPicker = openConfig
-	self.CloseConfigPicker = closeConfig
-	self.RefreshConfigPicker = refreshConfig
+	buildConfigModal()
 end
 
 return MidnightUI
