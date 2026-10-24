@@ -1,0 +1,65 @@
+# ❄️ Polar UI Library
+
+Современная, производительная и плавная библиотека графического интерфейса (UI Library) для скриптов в среде Luau / Roblox.
+
+---
+
+## ✨ Особенности
+
+- 🎨 **Современный дизайн**: строгая тёмная палитра, адаптивная типографика (`Geist`, `Onest`, `Inter`, `BuilderSans`) и процедурные тени.
+- ⚡ **Высокая производительность**: оптимизированная обработка твинов, адаптивное кеширование, поддержка `CanvasGroup` и безопасное скрытие элементов вне экрана.
+- 🧩 **Широкий набор компонентов**: Toggle, Slider, Dropdown (одиночный и множественный выбор), Colorpicker (RGB, HEX, HSV + прозрачность), Keybind, Input, Button, Label, Cards Grid, Submenu, Subtabs.
+- 🔗 **Инлайн-компоновка (Chaining)**: возможность встраивать цвет, выпадающие списки и всплывающие настройки прямо в одну строку с переключателем.
+- 🎛️ **Оверлеи «из коробки»**:
+  - Настраиваемый вотермарк (FPS, Ping, RAM, CPU, время, пользователь).
+  - Оверлей активных биндов (Keybinds list).
+  - Список наблюдателей (Spectators list).
+  - Очередь событийных уведомлений (Notification system).
+- 💾 **Встроенный менеджер профилей и конфигов**: экспорт, импорт, автозагрузка и генерация шеир-кодов.
+- 📱 **Поддержка мобильных устройств**: автоматическое определение мобильных платформ и кастомная кнопка быстрого открытия UI.
+- 🔒 **Защита интерфейса**: автоматическая интеграция с `gethui()` и `protect_gui()`.
+
+---
+
+## 🚀 Быстрый старт
+
+```lua
+local PolarLib = loadstring(readfile("PolarLib.lua"))()
+
+-- 1. Инициализация окна
+local Window = PolarLib:window({
+    title = "My Script",
+    folder = "my_script_configs",
+    key = "Insert"
+})
+
+-- 2. Создание вкладки и секции
+local MainTab = Window:tab({ name = "General", icon = "gear" })
+local MainSection = MainTab:section({ name = "Main Features", side = 1 })
+
+-- 3. Добавление компонентов
+MainSection:toggle({
+    name = "Enable Feature",
+    flag = "feature_enabled",
+    default = false,
+    cb = function(state)
+        print("Feature state:", state)
+    end
+})
+
+MainSection:slider({
+    name = "Speed Multiplier",
+    flag = "speed_mult",
+    min = 1,
+    max = 20,
+    default = 10,
+    suffix = "x",
+    cb = function(val)
+        print("Speed:", val)
+    end
+})
+
+-- 4. Добавление стандартных настроек и менеджера конфигов
+local SettingsTab = Window:tab({ name = "Settings", icon = "sliders" })
+SettingsTab:page("Menu"):settings()
+SettingsTab:page("Configs"):configs()
